@@ -157,7 +157,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 
 	if !h.acquire(auth) {
-		h.ingestUsage(auth, nil, nil, time.Since(start), false, "server_or_cliproxy_429", 429, "rate_limited", "rate_limited", false, nil)
+		h.ingestUsage(auth, "", nil, nil, time.Since(start), false, "server_or_cliproxy_429", 429, "rate_limited", "rate_limited", false, nil)
 		c.JSON(429, gin.H{"ok": false, "error": "rate_limited"})
 		return
 	}
@@ -186,7 +186,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	lease, leaseErr := h.requestLease(c.Request.Context(), requestedModel)
 	if leaseErr != nil {
 		elapsed := time.Since(start)
-		h.ingestUsage(auth, nil, nil, elapsed, false, "no_dispatchable_route_ready", 503, "no_dispatchable_route_ready", leaseErr.Error(), false, nil)
+		h.ingestUsage(auth, requestedModel, nil, nil, elapsed, false, "no_dispatchable_route_ready", 503, "no_dispatchable_route_ready", leaseErr.Error(), false, nil)
 		c.JSON(503, gin.H{"ok": false, "error": "no_dispatchable_route_ready"})
 		return
 	}
@@ -196,7 +196,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	cred, credErr := h.getCredential(c.Request.Context(), tokenID)
 	if credErr != nil {
 		elapsed := time.Since(start)
-		h.ingestUsage(auth, &tokenID, &accountID, elapsed, false, "unauthorized", 503, "credential_material_not_found", credErr.Error(), false, nil)
+		h.ingestUsage(auth, requestedModel, &tokenID, &accountID, elapsed, false, "unauthorized", 503, "credential_material_not_found", credErr.Error(), false, nil)
 		c.JSON(503, gin.H{"ok": false, "error": "credential_material_not_found"})
 		return
 	}
@@ -217,7 +217,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	resp, err := h.httpClientProxied.Do(upReq)
 	if err != nil {
 		elapsed := time.Since(start)
-		h.ingestUsage(auth, &tokenID, &accountID, elapsed, false, "unknown", 503, "upstream_fetch_failed", err.Error(), false, nil)
+		h.ingestUsage(auth, requestedModel, &tokenID, &accountID, elapsed, false, "unknown", 503, "upstream_fetch_failed", err.Error(), false, nil)
 		c.JSON(503, gin.H{"ok": false, "error": "upstream_fetch_failed"})
 		return
 	}
@@ -240,7 +240,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		elapsed := time.Since(start)
 		success := resp.StatusCode >= 200 && resp.StatusCode < 300
 		failureReason := classifyFailure(resp.StatusCode, false)
-		h.ingestUsage(auth, &tokenID, &accountID, elapsed, success, failureReason, resp.StatusCode, "", "", success, usage)
+		h.ingestUsage(auth, requestedModel, &tokenID, &accountID, elapsed, success, failureReason, resp.StatusCode, "", "", success, usage)
 		return
 	}
 
@@ -300,7 +300,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	streamCompleted := obs.streamCompleted
 	success := resp.StatusCode >= 200 && resp.StatusCode < 300 && streamCompleted
 	failureReason := classifyFailure(resp.StatusCode, streamCompleted)
-	h.ingestUsage(auth, &tokenID, &accountID, elapsed, success, failureReason, resp.StatusCode, "", "", streamCompleted, obs.usage)
+	h.ingestUsage(auth, requestedModel, &tokenID, &accountID, elapsed, success, failureReason, resp.StatusCode, "", "", streamCompleted, obs.usage)
 }
 
 func (h *Handler) authenticate(c *gin.Context) (*publicAuthContext, bool) {
@@ -396,6 +396,12 @@ type lease struct {
 
 func (h *Handler) requestLease(ctx context.Context, requestedModel string) (*lease, error) {
 	reqID := "cliproxy-" + h.randHex8()
+
+	// OpenAPI execution-plane leases are scoped by model *family* (e.g. "default"), not by the
+	// requested model id (e.g. "gpt-5.4"). If we send the model id here, OpenAPI will deny the
+	// lease request even though dispatchable tokens exist.
+	modelFamilyScope := []string{"default"}
+
 	payload := map[string]any{
 		"meta": map[string]any{
 			"contractName":    "cliproxyapi-execution-plane",
@@ -411,7 +417,7 @@ func (h *Handler) requestLease(ctx context.Context, requestedModel string) (*lea
 		},
 		"lanes":             h.cfg.OpenAPIGateway.Lanes,
 		"provider":          nil,
-		"modelFamilyScope":  []string{requestedModel},
+		"modelFamilyScope":  modelFamilyScope,
 		"desiredLeaseCount": 1,
 		"minLeaseTtlMs":     h.cfg.OpenAPIGateway.MinLeaseTtlMs,
 		"requestedAt":       time.Now().UTC().Format(time.RFC3339Nano),
@@ -481,6 +487,7 @@ func (h *Handler) getCredential(ctx context.Context, tokenID string) (*credentia
 
 func (h *Handler) ingestUsage(
 	auth *publicAuthContext,
+	requestedModel string,
 	tokenID *string,
 	accountID *string,
 	elapsed time.Duration,
@@ -496,11 +503,12 @@ func (h *Handler) ingestUsage(
 	traceID := fmt.Sprintf("%s:%s:%s:responses", auth.TenantID, auth.KeyID, reqID)
 
 	payload := map[string]any{
-		"ownerUserId":         auth.OwnerUserID,
-		"tenantId":            auth.TenantID,
-		"keyId":               auth.KeyID,
-		"protocol":            "responses",
-		"model":               "unknown",
+		"ownerUserId": auth.OwnerUserID,
+		"tenantId":    auth.TenantID,
+		"keyId":       auth.KeyID,
+		"protocol":    "responses",
+		// Preserve the user-requested model id for usage accounting (OpenAPI authority truth).
+		"model":               requestedModel,
 		"requestId":           reqID,
 		"traceId":             traceID,
 		"success":             success,
