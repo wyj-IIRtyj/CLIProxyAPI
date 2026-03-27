@@ -193,7 +193,7 @@ func (h *Handler) ProbeBasic(c *gin.Context) {
 
 	// The Codex backend is strict about request shape (responses-style JSON).
 	// Keep this payload minimal but valid.
-	body := []byte(`{"model":"gpt-5.4","instructions":"You are a helpful assistant.","input":[{"role":"user","content":[{"type":"input_text","text":"OPENAPI_BASIC_PROBE"}]}],"stream":false}`)
+	body := []byte(`{"model":"gpt-5.4","instructions":"You are a helpful assistant.","input":[{"role":"user","content":[{"type":"input_text","text":"OPENAPI_BASIC_PROBE"}]}],"stream":false,"store":false}`)
 	status, ct, peek, err := h.callUpstream(c.Request.Context(), access, accountID, false, body)
 	if err != nil {
 		c.JSON(503, gin.H{"ok": false, "error": "upstream_fetch_failed"})
@@ -248,6 +248,7 @@ func (h *Handler) ProbePreflight(c *gin.Context) {
 			},
 		},
 		"stream":       false,
+		"store":        false,
 	}
 	body, _ := json.Marshal(payloadObj)
 	status, ct, peek, err := h.callUpstream(c.Request.Context(), access, accountID, false, body)
