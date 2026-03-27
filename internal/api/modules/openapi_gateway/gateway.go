@@ -191,10 +191,10 @@ func (h *Handler) ProbeBasic(c *gin.Context) {
 		accountID = strings.TrimSpace(*req.CredentialMaterial.AccountID)
 	}
 
-	// The Codex backend is strict about request shape (responses-style JSON).
-	// Keep this payload minimal but valid.
-	body := []byte(`{"model":"gpt-5.4","instructions":"You are a helpful assistant.","input":[{"role":"user","content":[{"type":"input_text","text":"OPENAPI_BASIC_PROBE"}]}],"stream":false,"store":false}`)
-	status, ct, peek, err := h.callUpstream(c.Request.Context(), access, accountID, false, body)
+	// The Codex backend is strict about request shape (responses-style JSON) and, in practice,
+	// tends to require streaming enabled. Treat probe success as "we can establish a stream".
+	body := []byte(`{"model":"gpt-5.4","instructions":"You are a helpful assistant.","input":[{"role":"user","content":[{"type":"input_text","text":"OPENAPI_BASIC_PROBE"}]}],"stream":true,"store":false}`)
+	status, ct, peek, err := h.callUpstreamProbeStream(c.Request.Context(), access, accountID, body)
 	if err != nil {
 		c.JSON(503, gin.H{"ok": false, "error": "upstream_fetch_failed"})
 		return
@@ -247,11 +247,11 @@ func (h *Handler) ProbePreflight(c *gin.Context) {
 				},
 			},
 		},
-		"stream":       false,
+		"stream":       true,
 		"store":        false,
 	}
 	body, _ := json.Marshal(payloadObj)
-	status, ct, peek, err := h.callUpstream(c.Request.Context(), access, accountID, false, body)
+	status, ct, peek, err := h.callUpstreamProbeStream(c.Request.Context(), access, accountID, body)
 	if err != nil {
 		c.JSON(503, gin.H{"ok": false, "error": "upstream_fetch_failed"})
 		return
@@ -265,6 +265,55 @@ func (h *Handler) ProbePreflight(c *gin.Context) {
 		return
 	}
 	c.Data(status, "application/json; charset=utf-8", []byte(peek))
+}
+
+func (h *Handler) callUpstreamProbeStream(ctx context.Context, accessToken string, accountID string, body []byte) (status int, contentType string, peek string, err error) {
+	// We only need a quick "can we open a stream" check, not a full response parse.
+	// Read a small prefix (first line or first bytes) then close.
+	upstreamURL := strings.TrimRight(h.cfg.OpenAPIGateway.UpstreamBaseURL, "/") + "/responses"
+	ctx, cancel := context.WithTimeout(ctx, 6*time.Second)
+	defer cancel()
+
+	makeReq := func() *http.Request {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("User-Agent", codexUserAgent)
+		req.Header.Set("Originator", codexOriginator)
+		req.Header.Set("Connection", "Keep-Alive")
+		req.Header.Set("Accept", "text/event-stream")
+		req.Header.Set("Session_id", "openapi-"+h.randHex8()+"-"+h.randHex8())
+		req.Header.Set("X-Client-Request-Id", "openapi-"+h.randHex8())
+		if strings.TrimSpace(accountID) != "" {
+			req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(accountID))
+		}
+		return req
+	}
+
+	// Try proxied first; if it returns an HTML mitigation page, retry once without proxy.
+	resp, err := h.httpClientProxied.Do(makeReq())
+	if err != nil && h.httpClientProxied != h.httpClient {
+		resp, err = h.httpClient.Do(makeReq())
+	}
+	if err != nil {
+		return 0, "", "", err
+	}
+	defer resp.Body.Close()
+	ct := resp.Header.Get("content-type")
+
+	// For SSE success we just need the server to start writing something.
+	reader := bufio.NewReader(resp.Body)
+	line, _ := reader.ReadBytes('\n')
+	peek = strings.TrimSpace(string(line))
+	if peek == "" {
+		// Fallback: try a few bytes without waiting forever.
+		buf := make([]byte, 256)
+		n, _ := reader.Read(buf)
+		if n > 0 {
+			peek = strings.TrimSpace(string(buf[:n]))
+		}
+	}
+	return resp.StatusCode, ct, peek, nil
 }
 
 func (h *Handler) Responses(c *gin.Context) {
