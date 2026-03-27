@@ -289,15 +289,23 @@ func (h *Handler) Responses(c *gin.Context) {
 	if m, ok := bodyObj["model"].(string); ok && strings.TrimSpace(m) != "" {
 		requestedModel = strings.TrimSpace(m)
 	}
-	if len(auth.ModelAllowlist) > 0 && !contains(auth.ModelAllowlist, requestedModel) {
-		c.JSON(403, gin.H{"ok": false, "error": "model_not_allowed", "model": requestedModel})
+	normalizedModel := normalizeModel(requestedModel)
+	if normalizedModel == "" {
+		normalizedModel = "gpt-5.4"
+	}
+	// Ensure upstream sees the base model id (no OpenAPI route prefix).
+	bodyObj["model"] = normalizedModel
+	bodyBytes, _ = json.Marshal(bodyObj)
+
+	if len(auth.ModelAllowlist) > 0 && !contains(auth.ModelAllowlist, normalizedModel) {
+		c.JSON(403, gin.H{"ok": false, "error": "model_not_allowed", "model": normalizedModel})
 		return
 	}
 
-	lease, leaseErr := h.requestLease(c.Request.Context(), requestedModel)
+	lease, leaseErr := h.requestLease(c.Request.Context(), normalizedModel)
 	if leaseErr != nil {
 		elapsed := time.Since(start)
-		h.ingestUsage(auth, requestedModel, requestID, traceID, nil, nil, elapsed, false, "no_dispatchable_route_ready", 503, "no_dispatchable_route_ready", leaseErr.Error(), false, nil)
+		h.ingestUsage(auth, normalizedModel, requestID, traceID, nil, nil, elapsed, false, "no_dispatchable_route_ready", 503, "no_dispatchable_route_ready", leaseErr.Error(), false, nil)
 		c.JSON(503, gin.H{"ok": false, "error": "no_dispatchable_route_ready"})
 		return
 	}
@@ -308,7 +316,7 @@ func (h *Handler) Responses(c *gin.Context) {
 	cred, credErr := h.getCredential(c.Request.Context(), tokenID)
 	if credErr != nil {
 		elapsed := time.Since(start)
-		h.ingestUsage(auth, requestedModel, requestID, traceID, &tokenID, &accountID, elapsed, false, "unauthorized", 503, "credential_material_not_found", credErr.Error(), false, nil)
+		h.ingestUsage(auth, normalizedModel, requestID, traceID, &tokenID, &accountID, elapsed, false, "unauthorized", 503, "credential_material_not_found", credErr.Error(), false, nil)
 		c.JSON(503, gin.H{"ok": false, "error": "credential_material_not_found"})
 		return
 	}
@@ -340,13 +348,21 @@ func (h *Handler) Responses(c *gin.Context) {
 		upReq.Header.Set("OpenAI-Project", v)
 	}
 
+	// Try proxied first; if it returns an HTML mitigation page, retry once without proxy.
 	resp, err := h.httpClientProxied.Do(upReq)
 	if err != nil {
-		elapsed := time.Since(start)
-		h.ingestUsage(auth, requestedModel, requestID, traceID, &tokenID, &accountID, elapsed, false, "unknown", 503, "upstream_fetch_failed", err.Error(), false, nil)
-		h.reportExecutionFailure(auth, lease, requestedModel, requestID, traceID, start, time.Now().UTC(), "network_transient", 503, "upstream_fetch_failed", err.Error(), true)
-		c.JSON(503, gin.H{"ok": false, "error": "upstream_fetch_failed"})
-		return
+		if h.httpClientProxied != h.httpClient {
+			upReq2, _ := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, upstreamURL, bytes.NewReader(bodyBytes))
+			upReq2.Header = upReq.Header.Clone()
+			resp, err = h.httpClient.Do(upReq2)
+		}
+		if err != nil {
+			elapsed := time.Since(start)
+			h.ingestUsage(auth, requestedModel, requestID, traceID, &tokenID, &accountID, elapsed, false, "unknown", 503, "upstream_fetch_failed", err.Error(), false, nil)
+			h.reportExecutionFailure(auth, lease, requestedModel, requestID, traceID, start, time.Now().UTC(), "network_transient", 503, "upstream_fetch_failed", err.Error(), true)
+			c.JSON(503, gin.H{"ok": false, "error": "upstream_fetch_failed"})
+			return
+		}
 	}
 	defer resp.Body.Close()
 
@@ -354,6 +370,19 @@ func (h *Handler) Responses(c *gin.Context) {
 	// Instead, convert to a stable JSON error and record the failure for ops/usage.
 	if resp.StatusCode >= 400 && strings.Contains(strings.ToLower(resp.Header.Get("content-type")), "text/html") {
 		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+		// Fallback direct if we were using a proxy.
+		if h.httpClientProxied != h.httpClient {
+			upReq2, _ := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, upstreamURL, bytes.NewReader(bodyBytes))
+			upReq2.Header = upReq.Header.Clone()
+			resp2, err2 := h.httpClient.Do(upReq2)
+			if err2 == nil && resp2 != nil {
+				defer resp2.Body.Close()
+				if !(resp2.StatusCode >= 400 && strings.Contains(strings.ToLower(resp2.Header.Get("content-type")), "text/html")) {
+					resp = resp2
+					goto CONTINUE_WITH_RESPONSE
+				}
+			}
+		}
 		elapsed := time.Since(start)
 		h.ingestUsage(
 			auth,
@@ -380,6 +409,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 
+CONTINUE_WITH_RESPONSE:
 	if !streamRequested {
 		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
 		for k, vv := range resp.Header {
@@ -677,28 +707,67 @@ func (h *Handler) authenticateInternal(c *gin.Context) bool {
 
 func (h *Handler) callUpstream(ctx context.Context, accessToken string, accountID string, stream bool, body []byte) (status int, contentType string, peek string, err error) {
 	upstreamURL := strings.TrimRight(h.cfg.OpenAPIGateway.UpstreamBaseURL, "/") + "/responses"
-	req, _ := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Authorization", "Bearer "+accessToken)
-	req.Header.Set("User-Agent", codexUserAgent)
-	req.Header.Set("Originator", codexOriginator)
-	req.Header.Set("Connection", "Keep-Alive")
-	if strings.TrimSpace(accountID) != "" {
-		req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(accountID))
+	makeReq := func() *http.Request {
+		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, upstreamURL, bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+accessToken)
+		req.Header.Set("User-Agent", codexUserAgent)
+		req.Header.Set("Originator", codexOriginator)
+		req.Header.Set("Connection", "Keep-Alive")
+		// These ids significantly reduce the chance of upstream mitigation on automated traffic.
+		// Match the main /codex/v1/responses request shape.
+		req.Header.Set("Session_id", "openapi-"+h.randHex8()+"-"+h.randHex8())
+		req.Header.Set("X-Client-Request-Id", "openapi-"+h.randHex8())
+		if strings.TrimSpace(accountID) != "" {
+			req.Header.Set("Chatgpt-Account-Id", strings.TrimSpace(accountID))
+		}
+		if stream {
+			req.Header.Set("Accept", "text/event-stream")
+		} else {
+			req.Header.Set("Accept", "application/json")
+		}
+		return req
 	}
-	if stream {
-		req.Header.Set("Accept", "text/event-stream")
-	} else {
-		req.Header.Set("Accept", "application/json")
+
+	// Try proxied first; if it returns an HTML mitigation page, retry once without proxy.
+	resp, err := h.httpClientProxied.Do(makeReq())
+	if err != nil && h.httpClientProxied != h.httpClient {
+		resp, err = h.httpClient.Do(makeReq())
 	}
-	resp, err := h.httpClientProxied.Do(req)
 	if err != nil {
 		return 0, "", "", err
 	}
 	defer resp.Body.Close()
 	ct := resp.Header.Get("content-type")
 	payload, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+	if resp.StatusCode >= 400 && strings.Contains(strings.ToLower(ct), "text/html") && h.httpClientProxied != h.httpClient {
+		_ = resp.Body.Close()
+		resp2, err2 := h.httpClient.Do(makeReq())
+		if err2 == nil && resp2 != nil {
+			defer resp2.Body.Close()
+			ct2 := resp2.Header.Get("content-type")
+			payload2, _ := io.ReadAll(io.LimitReader(resp2.Body, 512*1024))
+			return resp2.StatusCode, ct2, strings.TrimSpace(string(payload2[:minInt(len(payload2), 200)])), nil
+		}
+	}
 	return resp.StatusCode, ct, strings.TrimSpace(string(payload[:minInt(len(payload), 200)])), nil
+}
+
+func normalizeModel(model string) string {
+	m := strings.TrimSpace(model)
+	if m == "" {
+		return ""
+	}
+	// Accept OpenAPI route-scoped model ids used by some clients: `openapi-<routeId>/<baseModel>`.
+	// The gateway is responsible for lease routing; upstream only cares about `<baseModel>`.
+	if strings.HasPrefix(m, "openapi-") && strings.Contains(m, "/") {
+		parts := strings.Split(m, "/")
+		last := strings.TrimSpace(parts[len(parts)-1])
+		if last != "" {
+			return last
+		}
+	}
+	return m
 }
 
 func (h *Handler) getCredential(ctx context.Context, tokenID string) (*credentialMaterial, error) {
