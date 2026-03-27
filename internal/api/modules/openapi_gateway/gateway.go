@@ -191,8 +191,9 @@ func (h *Handler) ProbeBasic(c *gin.Context) {
 		accountID = strings.TrimSpace(*req.CredentialMaterial.AccountID)
 	}
 
-	// The Codex backend requires `instructions` for responses payloads.
-	body := []byte(`{"model":"gpt-5.4","instructions":"You are a helpful assistant.","input":"OPENAPI_BASIC_PROBE","stream":false}`)
+	// The Codex backend is strict about request shape (responses-style JSON).
+	// Keep this payload minimal but valid.
+	body := []byte(`{"model":"gpt-5.4","instructions":"You are a helpful assistant.","input":[{"role":"user","content":[{"type":"input_text","text":"OPENAPI_BASIC_PROBE"}]}],"stream":false}`)
 	status, ct, peek, err := h.callUpstream(c.Request.Context(), access, accountID, false, body)
 	if err != nil {
 		c.JSON(503, gin.H{"ok": false, "error": "upstream_fetch_failed"})
@@ -238,7 +239,14 @@ func (h *Handler) ProbePreflight(c *gin.Context) {
 	payloadObj := map[string]any{
 		"model":        model,
 		"instructions": "You are a helpful assistant.",
-		"input":        prompt,
+		"input": []any{
+			map[string]any{
+				"role": "user",
+				"content": []any{
+					map[string]any{"type": "input_text", "text": prompt},
+				},
+			},
+		},
 		"stream":       false,
 	}
 	body, _ := json.Marshal(payloadObj)
