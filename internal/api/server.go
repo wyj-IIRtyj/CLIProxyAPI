@@ -349,6 +349,7 @@ func (s *Server) setupRoutes() {
 			// Internal validator probes (used by OpenAPI token-intake). Protected by internal caller token.
 			codex.POST("/probe/basic", openapiGatewayHandlers.ProbeBasic)
 			codex.POST("/probe/preflight", openapiGatewayHandlers.ProbePreflight)
+			codex.GET("/internal/metrics", openapiGatewayHandlers.InternalMetrics)
 		}
 	}
 

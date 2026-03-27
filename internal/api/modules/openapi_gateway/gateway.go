@@ -38,6 +38,9 @@ type Handler struct {
 	// Simple in-process per-tenant limiter (concurrency + QPS).
 	mu       sync.Mutex
 	tenants  map[string]*tenantLimiter
+	globalInFlight int
+	inFlightSamples []inFlightSample
+	last1mMaxInFlight int
 	now      func() time.Time
 	randHex8 func() string
 }
@@ -50,6 +53,11 @@ type tenantLimiter struct {
 	qpsLimit int
 	tokens   float64
 	lastRef  time.Time
+}
+
+type inFlightSample struct {
+	tsSec   int64
+	maxSeen int
 }
 
 type probeRequest struct {
@@ -628,6 +636,8 @@ func (h *Handler) acquire(auth *publicAuthContext) bool {
 	}
 	lim.tokens -= 1
 	lim.inFlight += 1
+	h.globalInFlight += 1
+	h.observeInFlightLocked(now, h.globalInFlight)
 	return true
 }
 
@@ -641,6 +651,57 @@ func (h *Handler) release(auth *publicAuthContext) {
 	if lim.inFlight > 0 {
 		lim.inFlight -= 1
 	}
+	if h.globalInFlight > 0 {
+		h.globalInFlight -= 1
+	}
+	h.observeInFlightLocked(h.now(), h.globalInFlight)
+}
+
+func (h *Handler) observeInFlightLocked(now time.Time, inFlight int) {
+	ts := now.Unix()
+	if n := len(h.inFlightSamples); n > 0 && h.inFlightSamples[n-1].tsSec == ts {
+		if inFlight > h.inFlightSamples[n-1].maxSeen {
+			h.inFlightSamples[n-1].maxSeen = inFlight
+		}
+	} else {
+		h.inFlightSamples = append(h.inFlightSamples, inFlightSample{tsSec: ts, maxSeen: inFlight})
+	}
+
+	// Keep a rolling 60-second window (inclusive).
+	cutoff := ts - 59
+	i := 0
+	for i < len(h.inFlightSamples) && h.inFlightSamples[i].tsSec < cutoff {
+		i++
+	}
+	if i > 0 {
+		copy(h.inFlightSamples, h.inFlightSamples[i:])
+		h.inFlightSamples = h.inFlightSamples[:len(h.inFlightSamples)-i]
+	}
+
+	max1m := 0
+	for _, s := range h.inFlightSamples {
+		if s.maxSeen > max1m {
+			max1m = s.maxSeen
+		}
+	}
+	h.last1mMaxInFlight = max1m
+}
+
+func (h *Handler) InternalMetrics(c *gin.Context) {
+	if !h.authenticateInternal(c) {
+		return
+	}
+	h.mu.Lock()
+	inFlight := h.globalInFlight
+	last1mMax := h.last1mMaxInFlight
+	h.mu.Unlock()
+
+	c.JSON(200, gin.H{
+		"ok":                true,
+		"inFlight":          inFlight,
+		"last1mMaxInFlight": last1mMax,
+		"sampledAt":         h.now().UTC().Format(time.RFC3339Nano),
+	})
 }
 
 type lease struct {
