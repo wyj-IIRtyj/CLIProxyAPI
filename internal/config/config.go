@@ -112,6 +112,10 @@ type Config struct {
 	// AmpCode contains Amp CLI upstream configuration, management restrictions, and model mappings.
 	AmpCode AmpCode `yaml:"ampcode" json:"ampcode"`
 
+	// OpenAPIGateway enables an OpenAPI-controlled public gateway surface (e.g. /codex/v1/responses)
+	// where credential selection and stats ingestion are delegated to an OpenAPI control plane.
+	OpenAPIGateway OpenAPIGateway `yaml:"openapi-gateway" json:"-"`
+
 	// OAuthExcludedModels defines per-provider global model exclusions applied to OAuth/file-backed auth entries.
 	OAuthExcludedModels map[string][]string `yaml:"oauth-excluded-models,omitempty" json:"oauth-excluded-models,omitempty"`
 
@@ -127,6 +131,26 @@ type Config struct {
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
 	legacyMigrationPending bool `yaml:"-" json:"-"`
+}
+
+type OpenAPIGateway struct {
+	Enabled bool `yaml:"enabled" json:"-"`
+
+	// ControlPlaneBaseURL points to OpenAPI server (internal). Example: http://127.0.0.1:3199
+	ControlPlaneBaseURL string `yaml:"control-plane-base-url" json:"-"`
+	InternalCaller      string `yaml:"internal-caller" json:"-"`
+	InternalToken       string `yaml:"internal-token" json:"-"`
+
+	SchemaRevision      string   `yaml:"schema-revision" json:"-"`
+	ExecutionInstanceID string   `yaml:"execution-instance-id" json:"-"`
+	ExecutionNodeID     string   `yaml:"execution-node-id" json:"-"`
+	RuntimeClass        string   `yaml:"runtime-class" json:"-"`
+	Region              *string  `yaml:"region" json:"-"`
+	Lanes               []string `yaml:"lanes" json:"-"`
+	MinLeaseTtlMs       int      `yaml:"min-lease-ttl-ms" json:"-"`
+
+	UpstreamBaseURL  string `yaml:"upstream-base-url" json:"-"`
+	UpstreamProxyURL string `yaml:"upstream-proxy-url" json:"-"`
 }
 
 // ClaudeHeaderDefaults configures default header values injected into Claude API requests.
@@ -652,6 +676,47 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 
 	// Sanitize OpenAI compatibility providers: drop entries without base-url
 	cfg.SanitizeOpenAICompatibility()
+
+	// Sanitize OpenAPI gateway config.
+	cfg.OpenAPIGateway.ControlPlaneBaseURL = strings.TrimSpace(cfg.OpenAPIGateway.ControlPlaneBaseURL)
+	cfg.OpenAPIGateway.InternalCaller = strings.TrimSpace(cfg.OpenAPIGateway.InternalCaller)
+	cfg.OpenAPIGateway.InternalToken = strings.TrimSpace(cfg.OpenAPIGateway.InternalToken)
+	cfg.OpenAPIGateway.SchemaRevision = strings.TrimSpace(cfg.OpenAPIGateway.SchemaRevision)
+	cfg.OpenAPIGateway.ExecutionInstanceID = strings.TrimSpace(cfg.OpenAPIGateway.ExecutionInstanceID)
+	cfg.OpenAPIGateway.ExecutionNodeID = strings.TrimSpace(cfg.OpenAPIGateway.ExecutionNodeID)
+	cfg.OpenAPIGateway.RuntimeClass = strings.TrimSpace(cfg.OpenAPIGateway.RuntimeClass)
+	cfg.OpenAPIGateway.UpstreamBaseURL = strings.TrimSpace(cfg.OpenAPIGateway.UpstreamBaseURL)
+	cfg.OpenAPIGateway.UpstreamProxyURL = strings.TrimSpace(cfg.OpenAPIGateway.UpstreamProxyURL)
+	if cfg.OpenAPIGateway.MinLeaseTtlMs <= 0 {
+		cfg.OpenAPIGateway.MinLeaseTtlMs = 15000
+	}
+	if cfg.OpenAPIGateway.Enabled {
+		if cfg.OpenAPIGateway.ControlPlaneBaseURL == "" {
+			log.Warn("openapi-gateway enabled but control-plane-base-url is empty; disabling")
+			cfg.OpenAPIGateway.Enabled = false
+		}
+		if cfg.OpenAPIGateway.InternalCaller == "" {
+			cfg.OpenAPIGateway.InternalCaller = "cliproxyapi"
+		}
+		if cfg.OpenAPIGateway.ExecutionInstanceID == "" {
+			cfg.OpenAPIGateway.ExecutionInstanceID = "cliproxyapi-openapi-gateway"
+		}
+		if cfg.OpenAPIGateway.ExecutionNodeID == "" {
+			cfg.OpenAPIGateway.ExecutionNodeID = "node-1"
+		}
+		if cfg.OpenAPIGateway.RuntimeClass == "" {
+			cfg.OpenAPIGateway.RuntimeClass = "cliproxyapi-shadow"
+		}
+		if cfg.OpenAPIGateway.SchemaRevision == "" {
+			cfg.OpenAPIGateway.SchemaRevision = "shadow"
+		}
+		if len(cfg.OpenAPIGateway.Lanes) == 0 {
+			cfg.OpenAPIGateway.Lanes = []string{"general_active"}
+		}
+		if cfg.OpenAPIGateway.UpstreamBaseURL == "" {
+			cfg.OpenAPIGateway.UpstreamBaseURL = "https://chatgpt.com/backend-api/codex"
+		}
+	}
 
 	// Normalize OAuth provider model exclusion map.
 	cfg.OAuthExcludedModels = NormalizeOAuthExcludedModels(cfg.OAuthExcludedModels)

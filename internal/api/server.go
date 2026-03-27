@@ -24,6 +24,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/middleware"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules"
 	ampmodule "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/amp"
+	openapigateway "github.com/router-for-me/CLIProxyAPI/v6/internal/api/modules/openapi_gateway"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/logging"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/managementasset"
@@ -323,6 +324,7 @@ func (s *Server) setupRoutes() {
 	geminiCLIHandlers := gemini.NewGeminiCLIAPIHandler(s.handlers)
 	claudeCodeHandlers := claude.NewClaudeCodeAPIHandler(s.handlers)
 	openaiResponsesHandlers := openai.NewOpenAIResponsesAPIHandler(s.handlers)
+	openapiGatewayHandlers := openapigateway.New(s.cfg)
 
 	// OpenAI compatible API routes
 	v1 := s.engine.Group("/v1")
@@ -336,6 +338,15 @@ func (s *Server) setupRoutes() {
 		v1.GET("/responses", openaiResponsesHandlers.ResponsesWebsocket)
 		v1.POST("/responses", openaiResponsesHandlers.Responses)
 		v1.POST("/responses/compact", openaiResponsesHandlers.Compact)
+	}
+
+	// OpenAPI gateway surface (OpenAPI-controlled auth + scheduling).
+	if s.cfg.OpenAPIGateway.Enabled {
+		codex := s.engine.Group("/codex/v1")
+		{
+			codex.GET("/models", openapiGatewayHandlers.Models)
+			codex.POST("/responses", openapiGatewayHandlers.Responses)
+		}
 	}
 
 	// Gemini compatible API routes
