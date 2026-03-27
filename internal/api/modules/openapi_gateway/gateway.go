@@ -22,6 +22,13 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+const (
+	// Mirror the headers used by CLIProxyAPI's own Codex executor. The Codex backend is sensitive
+	// to request shape and client identity; a generic Go UA tends to trigger mitigations.
+	codexUserAgent  = "codex_cli_rs/0.116.0 (Mac OS 26.0.1; arm64) Apple_Terminal/464"
+	codexOriginator = "codex_cli_rs"
+)
+
 type Handler struct {
 	cfg *config.Config
 
@@ -173,6 +180,7 @@ func (h *Handler) Responses(c *gin.Context) {
 		c.JSON(400, gin.H{"ok": false, "error": "invalid_json_body"})
 		return
 	}
+	streamRequested, _ := bodyObj["stream"].(bool)
 
 	requestedModel := "gpt-5.4"
 	if m, ok := bodyObj["model"].(string); ok && strings.TrimSpace(m) != "" {
@@ -201,10 +209,24 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 
-	upstreamURL := strings.TrimRight(h.cfg.OpenAPIGateway.UpstreamBaseURL, "/") + "/v1/responses"
+	// Note: the Codex backend uses `/backend-api/codex/responses` (no `/v1` segment).
+	upstreamURL := strings.TrimRight(h.cfg.OpenAPIGateway.UpstreamBaseURL, "/") + "/responses"
 	upReq, _ := http.NewRequestWithContext(c.Request.Context(), http.MethodPost, upstreamURL, bytes.NewReader(bodyBytes))
 	upReq.Header.Set("Content-Type", "application/json")
 	upReq.Header.Set("Authorization", "Bearer "+cred.AccessToken)
+	upReq.Header.Set("User-Agent", codexUserAgent)
+	if streamRequested {
+		upReq.Header.Set("Accept", "text/event-stream")
+	} else {
+		upReq.Header.Set("Accept", "application/json")
+	}
+	upReq.Header.Set("Connection", "Keep-Alive")
+	upReq.Header.Set("Originator", codexOriginator)
+	if strings.TrimSpace(accountID) != "" {
+		upReq.Header.Set("Chatgpt-Account-Id", accountID)
+	}
+	upReq.Header.Set("Session_id", "openapi-"+h.randHex8()+"-"+h.randHex8())
+	upReq.Header.Set("X-Client-Request-Id", "openapi-"+h.randHex8())
 
 	// propagate a few headers that matter for clients
 	if v := c.GetHeader("OpenAI-Organization"); v != "" {
@@ -250,7 +272,6 @@ func (h *Handler) Responses(c *gin.Context) {
 		return
 	}
 
-	streamRequested, _ := bodyObj["stream"].(bool)
 	if !streamRequested {
 		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
 		for k, vv := range resp.Header {
