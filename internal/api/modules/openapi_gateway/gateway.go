@@ -223,6 +223,33 @@ func (h *Handler) Responses(c *gin.Context) {
 	}
 	defer resp.Body.Close()
 
+	// Cloudflare (and similar) mitigation often returns HTML. Never pass HTML to API clients.
+	// Instead, convert to a stable JSON error and record the failure for ops/usage.
+	if resp.StatusCode >= 400 && strings.Contains(strings.ToLower(resp.Header.Get("content-type")), "text/html") {
+		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 512*1024))
+		elapsed := time.Since(start)
+		h.ingestUsage(
+			auth,
+			requestedModel,
+			&tokenID,
+			&accountID,
+			elapsed,
+			false,
+			"cloudflare_challenge",
+			503,
+			"upstream_blocked_cloudflare",
+			"cloudflare_challenge",
+			false,
+			nil,
+		)
+		c.JSON(503, gin.H{
+			"ok":    false,
+			"error": "upstream_blocked_cloudflare",
+			"peek":  strings.TrimSpace(string(payload[:minInt(len(payload), 200)])),
+		})
+		return
+	}
+
 	streamRequested, _ := bodyObj["stream"].(bool)
 	if !streamRequested {
 		payload, _ := io.ReadAll(io.LimitReader(resp.Body, 16*1024*1024))
@@ -301,6 +328,13 @@ func (h *Handler) Responses(c *gin.Context) {
 	success := resp.StatusCode >= 200 && resp.StatusCode < 300 && streamCompleted
 	failureReason := classifyFailure(resp.StatusCode, streamCompleted)
 	h.ingestUsage(auth, requestedModel, &tokenID, &accountID, elapsed, success, failureReason, resp.StatusCode, "", "", streamCompleted, obs.usage)
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func (h *Handler) authenticate(c *gin.Context) (*publicAuthContext, bool) {
