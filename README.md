@@ -1,5 +1,10 @@
 # CLI Proxy API
 
+> [!NOTE]
+> **About this fork:** this repository tracks the upstream [`router-for-me/CLIProxyAPI`](https://github.com/router-for-me/CLIProxyAPI) project. My work is developed on the [`openapi-gateway`](https://github.com/wyj-IIRtyj/CLIProxyAPI/tree/openapi-gateway) branch and focuses on a model-aware OpenAPI control-plane gateway rather than ownership of the upstream project.
+>
+> **My contributions include:** a `/codex/v1` gateway backed by the OpenAPI control plane, model-family lease selection, validator probes, Responses-style request normalization, execution feedback, and in-flight metrics. The upstream README — including sponsor material below — is preserved for context and attribution.
+
 English | [中文](README_CN.md) | [日本語](README_JA.md)
 
 A proxy server that provides OpenAI/Gemini/Claude/Codex compatible API interfaces for CLI.
